@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package main
+package fixes
 
 import (
 	"fmt"
@@ -15,52 +15,59 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/go-logr/logr"
 	"golang.org/x/tools/go/ast/astutil"
+	"github.com/thockin/klog-to-logr/fixer"
+	"github.com/thockin/klog-to-logr/importer"
 )
 
-func init() {
-	register(logrfix)
-}
+const StandardKlogPkg = "k8s.io/klog"
 
-var logrfix = Fix{
-	name: "logr",
-	fn:   doLogrFix,
-	desc: `Converts klog calls to logr calls`,
-}
-
-//FIXME: we should take this and the target pkg as CLI args
-const klogPkg = "k8s.io/klog"
-
-func getImportSpec(file *ast.File, pkg string) *ast.ImportSpec {
-	for _, s := range file.Imports {
-		if importPath(s) == pkg {
-			return s
-		}
+func LogrFix(klogPkg string) fixer.Fix {
+	res := &logrFixMaker{
+		klogPkg: klogPkg,
 	}
-	return nil
-}
 
-// importPath returns the unquoted import path of s,
-// or "" if the path is not properly quoted.
-func importPath(s *ast.ImportSpec) string {
-	t, err := strconv.Unquote(s.Path.Value)
-	if err == nil {
-		return t
+	return fixer.Fix{
+		Name: "logr",
+		Execute: res.fix,
+		Description: `Converts klog calls to logr calls`,
 	}
-	return ""
 }
 
-func doLogrFix(filename string, file *ast.File) bool {
+type logrFixMaker struct {
+	klogPkg string
+}
+
+func (f *logrFixMaker) fix(info fixer.FileInfo, loader importer.Loader, log logr.Logger) bool {
+	return (&logrFix{
+		info: info,
+		loader: loader,
+		log: log,
+		logrFixMaker: f,
+	}).fix()
+}
+
+type logrFix struct {
+	log logr.Logger
+	loader importer.Loader
+	info fixer.FileInfo
+
+	*logrFixMaker
+}
+
+func (f *logrFix) fix() bool {
 	// If this file doesn't import klog, skip it.
-	impSpec := getImportSpec(file, klogPkg)
+	impSpec := getImportSpec(f.info.AST, f.klogPkg)
 	if impSpec == nil {
 		return false
 	}
 
 	// Find the canonical import info for the package.
-	bldpkg, err := build.Import(klogPkg, filepath.Dir(filename), 0)
+	// TODO(directxman12): don't repeat this over and over
+	bldpkg, err := build.Import(f.klogPkg, filepath.Dir(f.info.Name), 0)
 	if err != nil {
-		log.Error(err, "import failed", "pkg", klogPkg)
+		f.log.Error(err, "import failed", "pkg", f.klogPkg)
 		return false
 	}
 	pkgImport := bldpkg.ImportPath
@@ -74,18 +81,18 @@ func doLogrFix(filename string, file *ast.File) bool {
 	impSpec.Path = &ast.BasicLit{Kind: token.STRING, Value: `"k8s.io/client-go/log"`}
 
 	// Process the AST and fix up calls and references.
-	astutil.Apply(file, nil, func(cursor *astutil.Cursor) bool {
+	astutil.Apply(f.info.AST, nil, func(cursor *astutil.Cursor) bool {
 		// Try statement-calls to functions in our pkg.
-		tryPkgStmtCall(pkgName, cursor)
+		f.tryPkgStmtCall(pkgName, cursor)
 
 		// Try expression-calls to functions in our pkg.
-		tryPkgExprCall(pkgName, cursor)
+		f.tryPkgExprCall(pkgName, cursor)
 
 		// Try other symbols in our pkg.
-		tryPkgSymbol(pkgName, cursor)
+		f.tryPkgSymbol(pkgName, cursor)
 
 		// Try calls to methods on types in our pkg.
-		tryTypedCall(pkgImport, cursor)
+		f.tryTypedCall(pkgImport, cursor)
 
 		return true
 	})
@@ -104,7 +111,7 @@ func isPkgIdent(pkg string, id *ast.Ident) bool {
 	return false
 }
 
-func tryPkgStmtCall(pkgName string, cursor *astutil.Cursor) bool {
+func (f *logrFix) tryPkgStmtCall(pkgName string, cursor *astutil.Cursor) bool {
 	// We're looking for expression-statements (so we can add new statements if
 	// needed)...
 	stmt, ok := cursor.Node().(*ast.ExprStmt)
@@ -134,13 +141,13 @@ func tryPkgStmtCall(pkgName string, cursor *astutil.Cursor) bool {
 		return false
 	}
 
-	log.V(5).Info("found a package stmt-call", "func", selexpr.Sel.Name)
+	f.log.V(5).Info("found a package stmt-call", "func", selexpr.Sel.Name)
 
 	// We need to handle these in statement-context so we can add statements.
 	// It's better to handle as much as possible as expr-calls.
 	switch selexpr.Sel.Name {
 	case "Fatal", "Fatalf", "Fatalln":
-		fixError(selexpr, callexpr)
+		f.fixError(selexpr, callexpr)
 		cursor.InsertAfter(&ast.ExprStmt{
 			X: &ast.CallExpr{
 				Fun: &ast.SelectorExpr{
@@ -167,7 +174,7 @@ func tryPkgStmtCall(pkgName string, cursor *astutil.Cursor) bool {
 	return true
 }
 
-func tryPkgExprCall(pkgName string, cursor *astutil.Cursor) bool {
+func (f *logrFix) tryPkgExprCall(pkgName string, cursor *astutil.Cursor) bool {
 	// We're looking for call expressions...
 	callexpr, ok := cursor.Node().(*ast.CallExpr)
 	if !ok {
@@ -190,14 +197,14 @@ func tryPkgExprCall(pkgName string, cursor *astutil.Cursor) bool {
 		return false
 	}
 
-	log.V(5).Info("found a package expr-call", "func", selexpr.Sel.Name)
+	f.log.V(5).Info("found a package expr-call", "func", selexpr.Sel.Name)
 
 	// All of these could be embedded in larger expressions.
 	switch selexpr.Sel.Name {
 	case "Info", "Infof", "Infoln", "Warning", "Warningf", "Warningln":
 		fixInfo(selexpr, callexpr)
 	case "Error", "Errorf", "Errorln":
-		fixError(selexpr, callexpr)
+		f.fixError(selexpr, callexpr)
 	case "V":
 		// Nothing to do here, just the package name below.
 	default:
@@ -210,7 +217,7 @@ func tryPkgExprCall(pkgName string, cursor *astutil.Cursor) bool {
 	return true
 }
 
-func tryPkgSymbol(pkgName string, cursor *astutil.Cursor) bool {
+func (f *logrFix) tryPkgSymbol(pkgName string, cursor *astutil.Cursor) bool {
 	// We're looking for selector expressions...
 	selexpr, ok := cursor.Node().(*ast.SelectorExpr)
 	if !ok {
@@ -231,7 +238,7 @@ func tryPkgSymbol(pkgName string, cursor *astutil.Cursor) bool {
 		return false
 	}
 
-	log.V(5).Info("found a package symbol", "sym", selexpr.Sel.Name)
+	f.log.V(5).Info("found a package symbol", "sym", selexpr.Sel.Name)
 
 	switch selexpr.Sel.Name {
 	case "Level":
@@ -247,7 +254,7 @@ func tryPkgSymbol(pkgName string, cursor *astutil.Cursor) bool {
 	return true
 }
 
-func tryTypedCall(pkgImport string, cursor *astutil.Cursor) bool {
+func (f *logrFix) tryTypedCall(pkgImport string, cursor *astutil.Cursor) bool {
 	// We're looking for call expressions...
 	callexpr, ok := cursor.Node().(*ast.CallExpr)
 	if !ok {
@@ -260,7 +267,7 @@ func tryTypedCall(pkgImport string, cursor *astutil.Cursor) bool {
 		return false
 	}
 
-	t := typeInfo.Types[selexpr.X].Type
+	t := f.loader.TypeInfo().Types[selexpr.X].Type
 	if t == nil {
 		return false
 	}
@@ -271,7 +278,7 @@ func tryTypedCall(pkgImport string, cursor *astutil.Cursor) bool {
 	tp := t.String()[:dot]
 	tt := t.String()[dot+1:]
 	if tp == "" || tt == "" {
-		log.Error(nil, "invalid type string", "pkg", tp, "type", tt)
+		f.log.Error(nil, "invalid type string", "pkg", tp, "type", tt)
 		return false
 	}
 	if tp != pkgImport {
@@ -279,7 +286,7 @@ func tryTypedCall(pkgImport string, cursor *astutil.Cursor) bool {
 		return false
 	}
 
-	log.V(5).Info("found a method call", "type", tt)
+	f.log.V(5).Info("found a method call", "type", tt)
 
 	switch tt {
 	case "Verbose":
@@ -287,7 +294,7 @@ func tryTypedCall(pkgImport string, cursor *astutil.Cursor) bool {
 		case "Info", "Infof", "Infoln":
 			fixInfo(selexpr, callexpr)
 		default:
-			log.Error(nil, "unhandled method on Verbose", "method", selexpr.Sel.Name)
+			f.log.Error(nil, "unhandled method on Verbose", "method", selexpr.Sel.Name)
 			return false
 		}
 	case "Level":
@@ -323,15 +330,15 @@ func fixInfo(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) {
 	callexpr.Args = newArgs
 }
 
-func fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) {
+func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) {
 	selexpr.Sel = newIdent("Error", selexpr.Sel.Pos())
 
 	// Look for the best arg to use as the error.
 	isErrorType := []int{}
 	isNamedErr := -1
 	for i, arg := range callexpr.Args {
-		t := typeInfo.Types[arg].Type
-		log.V(5).Info("arg", "idx", i, "type", t.String())
+		t := f.loader.TypeInfo().Types[arg].Type
+		f.log.V(5).Info("arg", "idx", i, "type", t.String())
 		if t.String() == "error" {
 			isErrorType = append(isErrorType, i)
 			continue
@@ -393,4 +400,23 @@ func getFormatString(args []ast.Expr) *ast.BasicLit {
 		panic("First call argument is not a string")
 	}
 	return lit
+}
+
+func getImportSpec(file *ast.File, pkg string) *ast.ImportSpec {
+	for _, s := range file.Imports {
+		if importPath(s) == pkg {
+			return s
+		}
+	}
+	return nil
+}
+
+// importPath returns the unquoted import path of s,
+// or "" if the path is not properly quoted.
+func importPath(s *ast.ImportSpec) string {
+	t, err := strconv.Unquote(s.Path.Value)
+	if err == nil {
+		return t
+	}
+	return ""
 }

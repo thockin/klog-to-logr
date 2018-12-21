@@ -22,6 +22,10 @@ type Loader interface {
 	// PackageInfoFor returns the package information for the given package,
 	// without any explicit source directory.
 	PackageInfoFor(path string) *PackageInfo
+	// FileSet returns the token.FileSet containing the files loaded by this loader.
+	FileSet() *token.FileSet
+	// TypeInfo returns the types.Info containing typechecking information for files loaded by this loader.
+	TypeInfo() *types.Info
 }
 
 // pkgIdent contains identifying information for a particular import
@@ -56,6 +60,8 @@ type KindaFastImporter struct {
 	config *types.Config
 	// fileSet is the compiler fileSet used to track parsing errors
 	fileSet *token.FileSet
+	// typeInfo stores the typechecking information for later use
+	typeInfo *types.Info
 
 	// log is how we log information about what we're doing
 	log logr.Logger
@@ -67,6 +73,10 @@ func NewImporter(cwd string, log logr.Logger) (types.ImporterFrom, Loader) {
 		cwd: cwd,
 		packages: make(map[pkgIdent]*PackageInfo),
 		fileSet: token.NewFileSet(),
+		typeInfo: &types.Info{
+			Types: make(map[ast.Expr]types.TypeAndValue),
+			Defs:  make(map[*ast.Ident]types.Object),
+		},
 		log: log,
 	}
 	// config references the importer, so initialize it after
@@ -134,7 +144,7 @@ func (i *KindaFastImporter) ImportFrom(path, srcDir string, mode types.ImportMod
 		return nil, err
 	}
 	// ...and check them to get a package
-	pkg, err = i.config.Check(path, i.fileSet, files, nil)
+	pkg, err = i.config.Check(path, i.fileSet, files, i.typeInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +168,7 @@ func (i *KindaFastImporter) parsePackageFiles(buildPkg *build.Package) ([]*ast.F
 		wg.Add(1)
 		go func(ind int, filepath string) {
 			defer wg.Done()
-			files[ind], errors[ind] = parser.ParseFile(i.fileSet, filepath, nil, 0) // ok to access fset concurrently
+			files[ind], errors[ind] = parser.ParseFile(i.fileSet, filepath, nil, parser.ParseComments) // ok to access fset concurrently
 		}(ind, filepath.Join(buildPkg.Dir, filename))
 	}
 	wg.Wait()
@@ -179,4 +189,12 @@ func (i *KindaFastImporter) parsePackageFiles(buildPkg *build.Package) ([]*ast.F
 
 func (i *KindaFastImporter) PackageInfoFor(path string) *PackageInfo {
 	return i.packages[pkgIdent{path: path}]
+}
+
+func (i *KindaFastImporter) FileSet() *token.FileSet {
+	return i.fileSet
+}
+
+func (i *KindaFastImporter) TypeInfo() *types.Info {
+	return i.typeInfo
 }
