@@ -11,9 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/build"
 	"go/format"
-	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -26,8 +24,9 @@ import (
 	"strings"
 
 	"github.com/go-logr/glogr"
-	"github.com/go-logr/logr"
 	"k8s.io/klog/glog"
+
+	"github.com/thockin/klog-to-logr/importer"
 )
 
 var (
@@ -73,58 +72,39 @@ func usage() {
 	os.Exit(93)
 }
 
-type Package struct {
-	Name      string
-	ASTFiles  []*ast.File
-	Filenames []string
-}
-
-// Global logger.
-var log logr.Logger
-
 func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	log = glogr.New()
+	log := glogr.New()
 	defer glog.Flush()
 
 	if flag.NArg() == 0 {
 		usage()
 	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Error(err, "where are we?  Nobody knows...")
+		os.Exit(1)
+	}
+	
+	imp, loader := importer.NewImporter(cwd, log.WithName("importer"))
+
 	//FIXME: suport foo.com/repo/pkg/... syntax
+	// the go standard library code for this ^ is... a thing
+	// it lives at `cmd/go/internal/search/search.go`, holed up
+	// living its best life, only working in a couple of commands.
 	for i := 0; i < flag.NArg(); i++ {
 		arg := flag.Arg(i)
-		bldpkg, err := build.Import(arg, ".", 0)
+		_, err := imp.Import(arg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "can't fix %q: %v\n", arg, err)
+			log.Error(err, "unable to import package from argument", "path", arg)
 			os.Exit(1)
 		}
-		pkg := &Package{Name: arg}
-		conf := types.Config{Importer: importer.Default()} //FIXME: this is looking for .a dirs
-		//conf := types.Config{Importer: buildImporter{}} //FIXME: fails because it didn't parse fmt
-		dir, err := filepath.Abs(bldpkg.Dir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "can't get absolute path for pkg-dir %q: %v\n", bldpkg.Dir, err)
-			os.Exit(2)
-		}
-		for _, filename := range append(append([]string{}, bldpkg.GoFiles...), bldpkg.TestGoFiles...) {
-			path := filepath.Join(dir, filename)
-			ast, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "can't parse %q: %v\n", path, err)
-				os.Exit(3)
-			}
-			pkg.ASTFiles = append(pkg.ASTFiles, ast)
-			pkg.Filenames = append(pkg.Filenames, path)
-		}
-		_, err = conf.Check(".", fset, pkg.ASTFiles, typeInfo)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "can't typecheck %q: %v\n", arg, err)
-			os.Exit(4)
-		}
-		log.V(2).Info("processing package", "pkg", bldpkg.Dir)
+		pkg := loader.PackageInfoFor(arg)
+		pkgLog := log.WithValues("package", pkg.BuildInfo.ImportPath)
+		pkgLog.V(1).Info("fixing package")
 		if err := doPkg(pkg); err != nil {
 			fmt.Fprintf(os.Stderr, "aborting package %q: %v\n", arg, err)
 			os.Exit(5)
@@ -142,23 +122,6 @@ func gofmtFile(f *ast.File) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-type buildImporter struct{}
-
-func (bi buildImporter) Import(path string) (*types.Package, error) {
-	return bi.ImportFrom(path, "", 0)
-}
-func (buildImporter) ImportFrom(path, src string, mode types.ImportMode) (*types.Package, error) {
-	//FIXME: if we use this mode, save a cache for dups
-	bp, err := build.Import(path, src, 0) // build.FindOnly here and other?
-	if err != nil {
-		return nil, err
-	}
-	fmt.Printf("IMPORTING: %v from %v\n", bp.ImportPath, bp.Dir)
-	pkg := types.NewPackage(bp.Dir, bp.ImportPath)
-	pkg.SetImports(nil) //FIXME: do I need this?
-	pkg.MarkComplete()
-	return pkg, nil
-}
 
 func readFile(filename string) ([]byte, error) {
 	f, err := os.Open(filename)
@@ -174,10 +137,9 @@ func readFile(filename string) ([]byte, error) {
 	return src, nil
 }
 
-func doPkg(pkg *Package) error {
-	for i, _ := range pkg.ASTFiles {
-		filename := pkg.Filenames[i]
-		ast := pkg.ASTFiles[i]
+func doPkg(pkg *importer.PackageInfo) error {
+	for i, ast := range pkg.Files {
+		filename := pkg.BuildInfo.GoFiles[i]
 		if err := doFile(filename, ast); err != nil {
 			return err
 		}
