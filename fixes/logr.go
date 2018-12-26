@@ -23,29 +23,80 @@ import (
 
 const StandardKlogPkg = "k8s.io/klog"
 
-func LogrFix(klogPkg string) fixer.Fix {
+var (
+	errIdent = ast.NewIdent("err")
+
+	// errDecl is used to as a fake declaration to load the error interface correctly
+	errDecl = &ast.GenDecl{
+		Tok: token.VAR,
+		Specs: []ast.Spec{&ast.ValueSpec{
+			Names: []*ast.Ident{errIdent},
+			Type: ast.NewIdent("error"),
+		}},
+	}
+
+	errFile = &ast.File{
+		Name: ast.NewIdent("internal"),
+		Decls: []ast.Decl{errDecl},
+	}
+)
+
+// loadErrorType discovers the error type's interface for later use,
+// using the typechecker and a fake file.
+func loadErrorType() (*types.Interface, error) {
+	// set up our configurations (no need for an importer, etc)
+	checkConfig := &types.Config{}
+	typeInfo := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+	}
+	// load the error type's information into the above info
+	_, err := checkConfig.Check("<stdin>", token.NewFileSet(), []*ast.File{errFile}, typeInfo)
+	if err != nil {
+	//	log.Error(err, "unable to typecheck basic error declaration for determining error type")
+		return nil, err
+	}
+	errorObj := typeInfo.ObjectOf(errIdent)
+	if errorObj == nil {
+		// log.Error(err, "unable to fetch type info for error type")
+		return nil, err
+	}
+	// the error type will be a types.Named with an underlying interface
+	return errorObj.Type().Underlying().(*types.Interface), nil
+}
+
+func LogrFix(klogPkg string) (fixer.Fix, error) {
 	res := &logrFixMaker{
 		klogPkg: klogPkg,
+	}
+
+	var err error
+	res.errorInterface, err = loadErrorType()
+	if err != nil {
+		return fixer.Fix{}, err
 	}
 
 	return fixer.Fix{
 		Name: "logr",
 		Execute: res.fix,
 		Description: `Converts klog calls to logr calls`,
-	}
+	}, nil
 }
 
 type logrFixMaker struct {
 	klogPkg string
+	errorInterface *types.Interface
 }
 
 func (f *logrFixMaker) fix(info fixer.FileInfo, loader importer.Loader, log logr.Logger) bool {
-	return (&logrFix{
+	fixer := &logrFix{
 		info: info,
 		loader: loader,
 		log: log,
 		logrFixMaker: f,
-	}).fix()
+	}
+
+	return fixer.fix()
 }
 
 type logrFix struct {
@@ -339,16 +390,8 @@ func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) {
 	for i, arg := range callexpr.Args {
 		t := f.loader.TypeInfo().Types[arg].Type
 		f.log.V(5).Info("arg", "idx", i, "type", t.String())
-		if t.String() == "error" {
+		if types.Implements(t, f.errorInterface) {
 			isErrorType = append(isErrorType, i)
-			continue
-		}
-		// FIXME: should test if it implements error interface, don't know how yet
-		if ident, ok := arg.(*ast.Ident); ok {
-			if ident.Name == "err" {
-				isNamedErr = i
-			}
-			continue
 		}
 	}
 	errIndex := -1
