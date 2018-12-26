@@ -33,19 +33,12 @@ func (f byName) Len() int           { return len(f) }
 func (f byName) Swap(i, j int)      { f[i], f[j] = f[j], f[i] }
 func (f byName) Less(i, j int) bool { return f[i].Name < f[j].Name }
 
-func must(fix fixer.Fix, err error) fixer.Fix {
-	if err != nil {
-		panic(err.Error())
-	}
-	return fix
-}
-
 var (
 	doDiff = flag.Bool("diff", false, "print diffs instead of rewriting files")
 
 	allFixes = []fixer.Fix{
 		// TODO(thockin): take this as a CLI argument
-		must(fixes.LogrFix(fixes.StandardKlogPkg)),
+		fixes.Must(fixes.LogrFix(fixes.StandardKlogPkg)),
 	}
 )
 

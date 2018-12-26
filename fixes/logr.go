@@ -65,6 +65,7 @@ func loadErrorType() (*types.Interface, error) {
 	return errorObj.Type().Underlying().(*types.Interface), nil
 }
 
+// LogrFix returns a fixer.Fix that converts calls to klog to logr structured logging.
 func LogrFix(klogPkg string) (fixer.Fix, error) {
 	res := &logrFixMaker{
 		klogPkg: klogPkg,
@@ -83,11 +84,14 @@ func LogrFix(klogPkg string) (fixer.Fix, error) {
 	}, nil
 }
 
+// logrFixMaker produces individual instaces of logrFixes.  It carries common
+// configuration (like the klog package).
 type logrFixMaker struct {
 	klogPkg string
 	errorInterface *types.Interface
 }
 
+// fix constructs a logrFix, and runs it.  It implements the signature of fixer.Fix.Exectute.
 func (f *logrFixMaker) fix(info fixer.FileInfo, loader importer.Loader, log logr.Logger) bool {
 	fixer := &logrFix{
 		info: info,
@@ -99,6 +103,7 @@ func (f *logrFixMaker) fix(info fixer.FileInfo, loader importer.Loader, log logr
 	return fixer.fix()
 }
 
+// logrFix knows how to convert klog to logr.
 type logrFix struct {
 	log logr.Logger
 	loader importer.Loader
@@ -107,6 +112,7 @@ type logrFix struct {
 	*logrFixMaker
 }
 
+// fix traverses the AST, looking for calls to klog and replacing them with logr.
 func (f *logrFix) fix() bool {
 	// If this file doesn't import klog, skip it.
 	impSpec := getImportSpec(f.info.AST, f.klogPkg)
