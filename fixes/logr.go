@@ -18,7 +18,6 @@ import (
 	"github.com/go-logr/logr"
 	"golang.org/x/tools/go/ast/astutil"
 	"github.com/thockin/klog-to-logr/fixer"
-	"github.com/thockin/klog-to-logr/importer"
 )
 
 const StandardKlogPkg = "k8s.io/klog"
@@ -92,10 +91,9 @@ type logrFixMaker struct {
 }
 
 // fix constructs a logrFix, and runs it.  It implements the signature of fixer.Fix.Exectute.
-func (f *logrFixMaker) fix(info fixer.FileInfo, loader importer.Loader, log logr.Logger) bool {
+func (f *logrFixMaker) fix(info fixer.FileInfo, log logr.Logger) bool {
 	fixer := &logrFix{
 		info: info,
-		loader: loader,
 		log: log,
 		logrFixMaker: f,
 	}
@@ -106,7 +104,6 @@ func (f *logrFixMaker) fix(info fixer.FileInfo, loader importer.Loader, log logr
 // logrFix knows how to convert klog to logr.
 type logrFix struct {
 	log logr.Logger
-	loader importer.Loader
 	info fixer.FileInfo
 
 	*logrFixMaker
@@ -204,7 +201,11 @@ func (f *logrFix) tryPkgStmtCall(pkgName string, cursor *astutil.Cursor) bool {
 	// It's better to handle as much as possible as expr-calls.
 	switch selexpr.Sel.Name {
 	case "Fatal", "Fatalf", "Fatalln":
-		f.fixError(selexpr, callexpr)
+		fixed := f.fixError(selexpr, callexpr)
+		if !fixed {
+			return false
+		}
+
 		cursor.InsertAfter(&ast.ExprStmt{
 			X: &ast.CallExpr{
 				Fun: &ast.SelectorExpr{
@@ -259,9 +260,13 @@ func (f *logrFix) tryPkgExprCall(pkgName string, cursor *astutil.Cursor) bool {
 	// All of these could be embedded in larger expressions.
 	switch selexpr.Sel.Name {
 	case "Info", "Infof", "Infoln", "Warning", "Warningf", "Warningln":
-		fixInfo(selexpr, callexpr)
+		if fixed := f.fixInfo(selexpr, callexpr); !fixed {
+			return false
+		}
 	case "Error", "Errorf", "Errorln":
-		f.fixError(selexpr, callexpr)
+		if fixed := f.fixError(selexpr, callexpr); !fixed {
+			return false
+		}
 	case "V":
 		// Nothing to do here, just the package name below.
 	default:
@@ -324,7 +329,7 @@ func (f *logrFix) tryTypedCall(pkgImport string, cursor *astutil.Cursor) bool {
 		return false
 	}
 
-	t := f.loader.TypeInfo().Types[selexpr.X].Type
+	t := f.info.Package.TypesInfo.Types[selexpr.X].Type
 	if t == nil {
 		return false
 	}
@@ -349,7 +354,9 @@ func (f *logrFix) tryTypedCall(pkgImport string, cursor *astutil.Cursor) bool {
 	case "Verbose":
 		switch selexpr.Sel.Name {
 		case "Info", "Infof", "Infoln":
-			fixInfo(selexpr, callexpr)
+			if fixed := f.fixInfo(selexpr, callexpr); !fixed {
+				return false
+			}
 		default:
 			f.log.Error(nil, "unhandled method on Verbose", "method", selexpr.Sel.Name)
 			return false
@@ -369,10 +376,16 @@ func newIdent(name string, pos token.Pos) *ast.Ident {
 	return id
 }
 
-func fixInfo(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) {
+func (f *logrFix) fixInfo(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) bool {
+	fmtString := f.getFormatString(callexpr)
+	newArgs := []ast.Expr{fmtString}
+	if fmtString == nil {
+		// not a constant string
+		return false
+	}
+
 	selexpr.Sel = newIdent("Info", selexpr.Sel.Pos())
 
-	newArgs := []ast.Expr{getFormatString(callexpr.Args)}
 	// Generate the key-value args.
 	for i, arg := range callexpr.Args {
 		if i == 0 {
@@ -385,16 +398,23 @@ func fixInfo(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) {
 		newArgs = append(newArgs, &ast.BasicLit{Kind: token.STRING, Value: key}, arg)
 	}
 	callexpr.Args = newArgs
+	return true
 }
 
-func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) {
+func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) bool {
+	errStr := f.getFormatString(callexpr)
+	if errStr == nil {
+		// we had an error
+		return false
+	}
+
 	selexpr.Sel = newIdent("Error", selexpr.Sel.Pos())
 
 	// Look for the best arg to use as the error.
 	isErrorType := []int{}
 	isNamedErr := -1
 	for i, arg := range callexpr.Args {
-		t := f.loader.TypeInfo().Types[arg].Type
+		t := f.info.Package.TypesInfo.Types[arg].Type
 		f.log.V(5).Info("arg", "idx", i, "type", t.String())
 		if types.Implements(t, f.errorInterface) {
 			isErrorType = append(isErrorType, i)
@@ -417,7 +437,7 @@ func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) {
 		callexpr.Args = append(callexpr.Args[:errIndex], callexpr.Args[errIndex+1:]...)
 	}
 
-	newArgs := []ast.Expr{ast.NewIdent(errExpr), getFormatString(callexpr.Args)}
+	newArgs := []ast.Expr{ast.NewIdent(errExpr), errStr}
 	// Generate the key-value args.
 	for i, arg := range callexpr.Args {
 		if i == 0 {
@@ -430,6 +450,7 @@ func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) {
 		newArgs = append(newArgs, &ast.BasicLit{Kind: token.STRING, Value: key}, arg)
 	}
 	callexpr.Args = newArgs
+	return true
 }
 
 func fixInitFlags(selexpr *ast.SelectorExpr) {
@@ -437,16 +458,20 @@ func fixInitFlags(selexpr *ast.SelectorExpr) {
 	selexpr.Sel = newIdent("FIXME__InitFlags_is_not_supported", selexpr.Sel.Pos())
 }
 
-func getFormatString(args []ast.Expr) *ast.BasicLit {
+func (f *logrFix) getFormatString(callexpr *ast.CallExpr) *ast.BasicLit {
+	args := callexpr.Args
 	if len(args) == 0 {
-		panic("No call arguments found")
+		fixer.AddErrorFrom("No call arguments found", callexpr.Pos(), f.info.Package)
+		return nil
 	}
 	lit, ok := args[0].(*ast.BasicLit)
 	if !ok {
-		panic("First call argument is not a literal")
+		fixer.AddErrorFrom("First call argument is not a literal", callexpr.Pos(), f.info.Package)
+		return nil
 	}
 	if lit.Kind != token.STRING {
-		panic("First call argument is not a string")
+		fixer.AddErrorFrom("First call argument is not a string", callexpr.Pos(), f.info.Package)
+		return nil
 	}
 	return lit
 }
