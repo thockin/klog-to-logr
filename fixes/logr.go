@@ -124,7 +124,7 @@ func (f *logrFix) fix() bool {
 		f.log.Error(err, "import failed", "pkg", f.klogPkg)
 		return false
 	}
-	pkgImport := bldpkg.ImportPath
+	//pkgImport := bldpkg.ImportPath
 
 	// Get the name of the package.
 	pkgName := bldpkg.Name   // Self-defined
@@ -132,21 +132,25 @@ func (f *logrFix) fix() bool {
 		pkgName = impSpec.Name.Name
 	}
 	// Rewrite the import in the AST.
-	impSpec.Path = &ast.BasicLit{Kind: token.STRING, Value: `"k8s.io/client-go/log"`}
+	f.info.AST.Imports = append(f.info.AST.Imports, &ast.ImportSpec{
+		Path: &ast.BasicLit{Kind: token.STRING, Value: `"k8s.io/client-go/log"`},
+	})
+
+	impSpec.Path = &ast.BasicLit{Kind: token.STRING, Value: `"k8s.io/client-go/log/klog"`}
 
 	// Process the AST and fix up calls and references.
 	astutil.Apply(f.info.AST, nil, func(cursor *astutil.Cursor) bool {
 		// Try statement-calls to functions in our pkg.
 		f.tryPkgStmtCall(pkgName, cursor)
 
-		// Try expression-calls to functions in our pkg.
-		f.tryPkgExprCall(pkgName, cursor)
+		/*// Try expression-calls to functions in our pkg.
+		f.tryPkgExprCall(pkgName, cursor)*/
 
 		// Try other symbols in our pkg.
-		f.tryPkgSymbol(pkgName, cursor)
+		//f.tryPkgSymbol(pkgName, cursor)
 
 		// Try calls to methods on types in our pkg.
-		f.tryTypedCall(pkgImport, cursor)
+		//f.tryTypedCall(pkgImport, cursor)
 
 		return true
 	})
@@ -163,6 +167,13 @@ func isPkgIdent(pkg string, id *ast.Ident) bool {
 		return true
 	}
 	return false
+}
+
+func (f *logrFix) loggerSelector(basePos token.Pos) ast.Expr {
+	return &ast.SelectorExpr{
+		X: newIdent("log", basePos),
+		Sel: newIdent("Log", token.NoPos),
+	}
 }
 
 func (f *logrFix) tryPkgStmtCall(pkgName string, cursor *astutil.Cursor) bool {
@@ -185,14 +196,33 @@ func (f *logrFix) tryPkgStmtCall(pkgName string, cursor *astutil.Cursor) bool {
 		return false
 	}
 
-	// ... which anchor on simple identifiers.
-	id, ok := selexpr.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
+	// ... which either a) anchor on simple identifiers...
+	
+	if id, ok := selexpr.X.(*ast.Ident); ok {
+		if !isPkgIdent(pkgName, id) {
+			return false
+		}
+	// ... or anchor on a function call with anchors on a selector.
+	} else {
+		vCall, hasVCall := selexpr.X.(*ast.CallExpr)
+		if !hasVCall {
+			return false
+		}
+		f.log.Info("vCall", "vCall", vCall)
 
-	if !isPkgIdent(pkgName, id) {
-		return false
+		callSel, isSel := vCall.Fun.(*ast.SelectorExpr)
+		if !isSel {
+			return false
+		}
+		
+		id, ok := callSel.X.(*ast.Ident)
+		if !ok {
+			return false
+		}
+
+		if !isPkgIdent(pkgName, id) {
+			return false
+		}
 	}
 
 	f.log.V(5).Info("found a package stmt-call", "func", selexpr.Sel.Name)
@@ -201,33 +231,31 @@ func (f *logrFix) tryPkgStmtCall(pkgName string, cursor *astutil.Cursor) bool {
 	// It's better to handle as much as possible as expr-calls.
 	switch selexpr.Sel.Name {
 	case "Fatal", "Fatalf", "Fatalln":
-		fixed := f.fixError(selexpr, callexpr)
-		if !fixed {
+		newCall := f.errorExpr(selexpr, callexpr)
+		if newCall == nil {
 			return false
 		}
 
-		cursor.InsertAfter(&ast.ExprStmt{
-			X: &ast.CallExpr{
-				Fun: &ast.SelectorExpr{
-					X:   newIdent("os", 0),
-					Sel: newIdent("Exit", 0),
-				},
-				Args: []ast.Expr{
-					&ast.BasicLit{
-						Kind:  token.INT,
-						Value: "255",
-					},
-				},
-			},
-		})
-	case "InitFlags":
-		fixInitFlags(selexpr)
+		cursor.InsertBefore(&ast.ExprStmt{X: newCall})
+	case "Info", "Infof", "Infoln", "Warning", "Warningf", "Warningln":
+		newCall := f.infoExpr(selexpr, callexpr)
+		if newCall == nil {
+			return false
+		}
+
+		cursor.InsertBefore(&ast.ExprStmt{X: newCall})
+	case "Error", "Errorf", "Errorln":
+		newCall := f.errorExpr(selexpr, callexpr)
+		if newCall == nil {
+			return false
+		}
+
+		cursor.InsertBefore(&ast.ExprStmt{X: newCall})
+	case "V":
+		// Nothing to do here, just the package name below.
 	default:
 		return false
 	}
-
-	// Rewrite the package name.
-	selexpr.X = newIdent("log", selexpr.X.Pos())
 
 	return true
 }
@@ -274,7 +302,7 @@ func (f *logrFix) tryPkgExprCall(pkgName string, cursor *astutil.Cursor) bool {
 	}
 
 	// Rewrite the package name.
-	selexpr.X = newIdent("log", selexpr.X.Pos())
+	selexpr.X = f.loggerSelector(selexpr.X.Pos())
 
 	return true
 }
@@ -311,7 +339,7 @@ func (f *logrFix) tryPkgSymbol(pkgName string, cursor *astutil.Cursor) bool {
 	}
 
 	// Rewrite the package name.
-	selexpr.X = newIdent("log", selexpr.X.Pos())
+	selexpr.X = f.loggerSelector(selexpr.X.Pos())
 
 	return true
 }
@@ -376,15 +404,31 @@ func newIdent(name string, pos token.Pos) *ast.Ident {
 	return id
 }
 
-func (f *logrFix) fixInfo(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) bool {
+func (f *logrFix) infoExpr(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) *ast.CallExpr {
 	fmtString := f.getFormatString(callexpr)
 	newArgs := []ast.Expr{fmtString}
 	if fmtString == nil {
 		// not a constant string
-		return false
+		return nil
 	}
 
-	selexpr.Sel = newIdent("Info", selexpr.Sel.Pos())
+	loggerPath := f.loggerSelector(token.NoPos)
+	resSel := &ast.SelectorExpr{
+		X: loggerPath,
+		Sel: newIdent("Info", selexpr.Sel.Pos()),
+	}
+	if vCall, hasCall := selexpr.X.(*ast.CallExpr); hasCall {
+		vSel, isSel := vCall.Fun.(*ast.SelectorExpr)
+		if !isSel || vSel.Sel.Name != "V" {
+			fixer.AddErrorFrom("unknown V-like method provided", vCall.Pos(), f.info.Package)
+			return nil
+		}
+
+		resSel.X = &ast.CallExpr{
+			Fun: &ast.SelectorExpr{X: loggerPath, Sel: newIdent("V", token.NoPos)},
+			Args: vCall.Args,
+		}
+	}
 
 	// Generate the key-value args.
 	for i, arg := range callexpr.Args {
@@ -397,18 +441,48 @@ func (f *logrFix) fixInfo(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) boo
 		}
 		newArgs = append(newArgs, &ast.BasicLit{Kind: token.STRING, Value: key}, arg)
 	}
-	callexpr.Args = newArgs
-	return true
+
+	resCall := &ast.CallExpr{
+		Fun: resSel,
+		Args: newArgs,
+	}
+
+	return resCall
 }
 
-func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) bool {
-	errStr := f.getFormatString(callexpr)
-	if errStr == nil {
-		// we had an error
+func (f *logrFix) fixInfo(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) bool {
+	newCall := f.infoExpr(selexpr, callexpr)
+	if newCall == nil {
 		return false
 	}
 
-	selexpr.Sel = newIdent("Error", selexpr.Sel.Pos())
+	*callexpr = *newCall
+	
+	return true
+}
+
+func (f *logrFix) errorExpr(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) *ast.CallExpr {
+	errStr := f.getFormatString(callexpr)
+	if errStr == nil {
+		// we had an error
+		return nil
+	}
+
+	// TODO(directxman12): figure out what to do with verbosity
+	loggerPath := f.loggerSelector(token.NoPos)
+	resSel := &ast.SelectorExpr{
+		X: loggerPath,
+		Sel: newIdent("Error", selexpr.Sel.Pos()),
+	}
+	if vCall, hasCall := selexpr.X.(*ast.CallExpr); hasCall {
+		vSel, isSel := vCall.Fun.(*ast.SelectorExpr)
+		if !isSel || vSel.Sel.Name != "V" {
+			fixer.AddErrorFrom("unknown V-like method provided", vCall.Pos(), f.info.Package)
+			return nil
+		}
+
+		f.log.Info("dropping verbosity from call", "position", vCall.Pos())
+	}
 
 	// Look for the best arg to use as the error.
 	isErrorType := []int{}
@@ -431,16 +505,11 @@ func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) bo
 		errIndex = isNamedErr
 	}
 	errExpr := "FIXME__unknown_error_expr"
-	if errIndex >= 0 {
-		// Remember the expression to emit later and remove it from the args list.
-		errExpr = types.ExprString(callexpr.Args[errIndex])
-		callexpr.Args = append(callexpr.Args[:errIndex], callexpr.Args[errIndex+1:]...)
-	}
 
 	newArgs := []ast.Expr{ast.NewIdent(errExpr), errStr}
 	// Generate the key-value args.
 	for i, arg := range callexpr.Args {
-		if i == 0 {
+		if i == 0 || i == errIndex {
 			continue
 		}
 		key := `"FIXME__unknown_key"`
@@ -449,7 +518,22 @@ func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) bo
 		}
 		newArgs = append(newArgs, &ast.BasicLit{Kind: token.STRING, Value: key}, arg)
 	}
-	callexpr.Args = newArgs
+
+	resCall := &ast.CallExpr{
+		Fun: resSel,
+		Args: newArgs,
+	}
+
+	return resCall
+}
+
+func (f *logrFix) fixError(selexpr *ast.SelectorExpr, callexpr *ast.CallExpr) bool {
+	newCall := f.errorExpr(selexpr, callexpr)
+	if newCall == nil {
+		return false
+	}
+
+	*callexpr = *newCall
 	return true
 }
 
